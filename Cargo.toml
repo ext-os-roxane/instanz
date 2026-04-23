@@ -1,0 +1,20 @@
+[package]
+name = "instanz"
+description = "ExtOS hypervisor and runlevel engine — snapshots, weaver, container runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "instanz"
+path = "src/main.rs"
+
+[dependencies]
+libextos = { path = "../libextos" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
