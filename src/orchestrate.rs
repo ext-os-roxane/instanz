@@ -403,6 +403,9 @@ pub struct ApplyReport {
     pub bls_entries: usize,
     /// Orphan generation directories the sweep removed.
     pub reaped: Vec<u64>,
+    /// Declared security applied to the roof (PLAN 6.2 glue): AppArmor
+    /// profiles written, SELinux labels applied/refused.
+    pub security: libextos::security::RoofSecurityReport,
 }
 
 /// Execute the full local pipeline for `system`.
@@ -546,6 +549,41 @@ fn apply_inner(
     println!("[9/{STEPS}] post-weave tools (ldconfig, depmod)");
     postprocess(&snapshot.path, eval.system.kernel.as_deref())?;
 
+    // PLAN 6.2 glue: declared AppArmor profiles + SELinux labels for the roof.
+    let roof_packages: Vec<libextos::security::RoofPackage> = eval
+        .resolved
+        .iter()
+        .map(|r| libextos::security::RoofPackage {
+            label: r.label(),
+            hash: r.hash.clone(),
+        })
+        .collect();
+    let security = libextos::security::apply_roof_security(repo, &roof_packages, &snapshot.path)
+        .context("roof security pass failed")?;
+    if !security.apparmor_profiles.is_empty() {
+        println!(
+            "        apparmor: {} profile(s) written [{}]",
+            security.apparmor_profiles.len(),
+            security.apparmor_profiles.join(", ")
+        );
+    }
+    for skip in &security.apparmor_skipped {
+        println!("        ⚠ apparmor skipped: {skip}");
+    }
+    if security.selinux_applied > 0 {
+        println!("        selinux: {} file(s) labeled", security.selinux_applied);
+    }
+    for skip in &security.selinux_skipped {
+        println!("        ⚠ selinux skipped: {skip}");
+    }
+    let security_quiet = security.apparmor_profiles.is_empty()
+        && security.apparmor_skipped.is_empty()
+        && security.selinux_applied == 0
+        && security.selinux_skipped.is_empty();
+    if security_quiet {
+        println!("        security: nothing declared");
+    }
+
     println!("[10/{STEPS}] runlevel-0 forge (initramfs + BLS)");
     let forge_report = run_forge_phase(repo, &eval, opts, number)?;
 
@@ -601,7 +639,7 @@ fn apply_inner(
         phantom_rows
     );
 
-    Ok(ApplyReport {
+    let report = ApplyReport {
         generation: number,
         root: snapshot.path,
         plan_ops: execution.journal.len(),
@@ -610,7 +648,16 @@ fn apply_inner(
         forge: forge_token,
         bls_entries,
         reaped: reap.removed,
-    })
+        security,
+    };
+    println!(
+        "        security: {} apparmor profile(s), {} selinux label(s), {} skipped",
+        report.security.apparmor_profiles.len(),
+        report.security.selinux_applied,
+        report.security.apparmor_skipped.len() + report.security.selinux_skipped.len()
+    );
+
+    Ok(report)
 }
 
 /// Run the runlevel-0 forge phase for the generation that was just woven.
