@@ -168,6 +168,8 @@ fn instanz(repository: &Path) -> Command {
         .env_remove("EXTOS_REPOSITORY")
         .env_remove("EXTOS_ROOTFS")
         .env_remove("EXTOS_BLS_DIR")
+        .env_remove("EXTOS_BLS_ROOT")
+        .env_remove("EXTOS_FORGE_SCRATCH")
         .env_remove("EXTOS_MIRRORS_ARCHLINUX")
         .env_remove("EXTOS_MIRRORS_DEBIAN")
         .env_remove("EXTOS_CACHE_DIR")
@@ -252,19 +254,29 @@ fn apply_weaves_phantoms_and_records_a_generation() {
     assert_success(&output);
     let out = stdout(&output);
 
-    // Progress lines for every stage.
+    // Progress lines for every stage of the Phase-4 pipeline (4.1.1 – 4.1.6).
     for step in [
-        "[1/8] evaluate",
-        "[2/8] fetch missing packages",
-        "[3/8] plan",
-        "[4/8] snapshot before weave",
-        "[5/8] weave",
-        "[6/8] phantom rows",
-        "[7/8] post-weave tools",
-        "[8/8] lockfile + generation record",
+        "[1/11] expand",
+        "[2/11] fetch missing packages",
+        "[3/11] plan",
+        "[4/11] snapshot before weave",
+        "[5/11] weave",
+        "[6/11] seed /etc",
+        "[7/11] phantom rows",
+        "[8/11] /var + /home mounts",
+        "[9/11] post-weave tools",
+        "[10/11] runlevel-0 forge",
+        "[11/11] lockfile + generation record",
     ] {
         assert_contains(&out, step);
     }
+    // No boot root is configured and no package ships a generator: the forge
+    // says so loudly instead of silently doing nothing.
+    assert_contains(&out, "forge skipped: no boot root configured");
+    assert_contains(&out, "orphan sweep: no orphan generation");
+    // No /etc payload and no mount sources in this fixture: both are announced.
+    assert_contains(&out, "0 seeded, 0 kept (already present)");
+    assert_contains(&out, "no mount sources declared");
     // Already-cached refs never hit the network.
     assert_contains(&out, "0 fetched, 3 already in the CAS");
     assert!(!out.contains("cannot fetch"));

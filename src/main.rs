@@ -6,10 +6,16 @@
 //! blocking is not allowed", so there is deliberately no async runtime.
 //!
 //! Wired in Phase 2.5: `evaluate`, `apply`, `rollback`, `gc`, `generations`.
-//! `run`, `shell` and the raw `snapshot` verbs stay explicit `todo!()`s until
-//! their phases (container runtime, DevShells, snapshot UX) land.
+//! Phase-4 residual: `apply` now ends with a runlevel-0 forge (initramfs + BLS
+//! matrix, PLAN 4.2.6) and an orphan-generation sweep, and `run <profile>`
+//! boots a container from the applied generation (PLAN 4.4.8). `shell` and the
+//! raw `snapshot` verbs stay explicit `todo!()`s until their phases land.
 
+mod forge;
+mod mount;
 mod orchestrate;
+mod reaper;
+mod run;
 mod system;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +28,7 @@ use crate::orchestrate::{
     print_evaluation, print_generations, rollback,
 };
 use crate::system::SystemConfig;
+
 
 /// instanz — ExtOS Hypervisor & Runlevel Engine
 ///
@@ -50,7 +57,7 @@ enum Commands {
         /// Path to the system configuration file
         config: String,
     },
-    /// Apply a system configuration: fetch → snapshot → weave → phantom → tools
+    /// Apply a system configuration: fetch → snapshot → weave → phantom → tools → forge
     Apply {
         /// Path to the system configuration file
         #[arg(default_value = crate::system::DEFAULT_CONFIG_PATH)]
@@ -58,6 +65,13 @@ enum Commands {
         /// Generations root (default: `EXTOS_ROOTFS`, else the config's `root`)
         #[arg(long, env = "EXTOS_ROOTFS")]
         rootfs: Option<PathBuf>,
+        /// Boot root the forge writes the initramfs + BLS matrix into
+        /// (see `--bls-dir` for the legacy snapshot-entry mode)
+        #[arg(long, env = crate::forge::ENV_BOOT_ROOT)]
+        boot_root: Option<PathBuf>,
+        /// Legacy BLS entries directory (snapshot `gen-<n>.conf` entries, no forge)
+        #[arg(long, env = "EXTOS_BLS_DIR")]
+        bls_dir: Option<PathBuf>,
     },
     /// Rollback to a previous generation
     Rollback {
@@ -67,11 +81,38 @@ enum Commands {
         /// Generations root (default: `EXTOS_ROOTFS`)
         #[arg(long, env = "EXTOS_ROOTFS")]
         rootfs: Option<PathBuf>,
+        /// Boot root whose forge entry the loader default should point at
+        #[arg(long, env = crate::forge::ENV_BOOT_ROOT)]
+        boot_root: Option<PathBuf>,
+        /// Legacy BLS entries directory (`gen-<n>.conf` entries)
+        #[arg(long, env = "EXTOS_BLS_DIR")]
+        bls_dir: Option<PathBuf>,
     },
-    /// Spawn a Tier 4 container interactively
+    /// Spawn a container profile from the applied generation
     Run {
-        /// Container profile name (e.g., "android-subsystem", "firefox-sandboxed")
+        /// Container profile name (a system name or a package profile)
         profile: String,
+        /// Generations root (default: `EXTOS_ROOTFS`)
+        #[arg(long, env = "EXTOS_ROOTFS")]
+        rootfs: Option<PathBuf>,
+        /// Isolation level 0 (isolated) … 4 (privileged); overrides the profile
+        #[arg(long)]
+        level: Option<u8>,
+        /// Backend: native, nspawn, runc, crun, chroot
+        #[arg(long, env = "EXTOS_CONTAINER_BACKEND")]
+        backend: Option<String>,
+        /// Program inside the roof (overrides the profile entrypoint)
+        #[arg(long)]
+        program: Option<String>,
+        /// System config used for `containerPermissions` lookup
+        #[arg(long, env = crate::run::ENV_SYSTEM_CONFIG)]
+        config: Option<PathBuf>,
+        /// Explicit opt-in for a level-4 (privileged) launch
+        #[arg(long)]
+        allow_privileged: bool,
+        /// Arguments appended to the container program
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARG")]
+        args: Vec<String>,
     },
     /// Enter an ephemeral DevShell (Level 1 container from dev.nix)
     Shell {
@@ -92,6 +133,12 @@ enum Commands {
         /// Generations root (default: `EXTOS_ROOTFS`)
         #[arg(long, env = "EXTOS_ROOTFS")]
         rootfs: Option<PathBuf>,
+        /// Boot root whose forge entries the GC prunes
+        #[arg(long, env = crate::forge::ENV_BOOT_ROOT)]
+        boot_root: Option<PathBuf>,
+        /// Legacy BLS entries directory the GC prunes
+        #[arg(long, env = "EXTOS_BLS_DIR")]
+        bls_dir: Option<PathBuf>,
     },
     /// List all generations and their status
     Generations {
@@ -117,14 +164,30 @@ enum SnapshotAction {
     },
 }
 
-/// BLS entries directory, when the operator mapped one (`EXTOS_BLS_DIR`).
+/// Validate the two mutually exclusive boot-entry layouts.
 ///
-/// Production mapping: `EXTOS_BLS_DIR=/boot/loader/entries`. Unset means
-/// symlink-only mode — generations still switch, no bootloader entry is written.
-fn bls_dir() -> Option<PathBuf> {
-    std::env::var_os("EXTOS_BLS_DIR")
+/// `--boot-root` is the forge mode (initramfs + `extos-<system>-g<n>-<kernel>.conf`
+/// matrix); `--bls-dir` is the Phase-2 snapshot mode (`gen-<n>.conf`, no forge).
+/// Setting both is ambiguous, so it is a typed error instead of a silent pick.
+fn bls_modes(
+    boot_root: Option<PathBuf>,
+    bls_dir: Option<PathBuf>,
+) -> anyhow::Result<(Option<PathBuf>, Option<PathBuf>)> {
+    if boot_root.is_some() && bls_dir.is_some() {
+        bail!(
+            "both --boot-root/EXTOS_BLS_ROOT and --bls-dir/EXTOS_BLS_DIR are set: \
+             choose the forge mode (boot root) or the legacy snapshot-entry mode (entries dir)"
+        );
+    }
+    Ok((boot_root, bls_dir))
+}
+
+/// Scratch directory the forge stages its tmpfs under.
+fn forge_scratch() -> PathBuf {
+    std::env::var_os(forge::ENV_FORGE_SCRATCH)
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Rootfs for `apply`: CLI/env flag first, then the config's `root` key.
@@ -161,38 +224,86 @@ fn main() -> anyhow::Result<()> {
             print_evaluation(&evaluation, &repo);
             Ok(())
         }
-        Commands::Apply { config, rootfs } => {
+        Commands::Apply {
+            config,
+            rootfs,
+            boot_root,
+            bls_dir,
+        } => {
+            let (boot_root, bls_dir) = bls_modes(boot_root, bls_dir)?;
             let system = SystemConfig::load(Path::new(&config))?;
             let rootfs = rootfs_from_config(rootfs, system.root.clone())?;
             let repo = open_repo(&cli.repository, algo)?;
             let cache_dir = repo.root.join("cache");
-            let bls = bls_dir();
+            let scratch = forge_scratch();
+            let mounts = system.mount_sources();
             let options = ApplyOptions {
                 rootfs: &rootfs,
                 cache_dir: &cache_dir,
-                bls_dir: bls.as_deref(),
+                bls_dir: bls_dir.as_deref(),
+                boot_root: boot_root.as_deref(),
+                forge_scratch: &scratch,
+                mounts: &mounts,
             };
             let report = apply(&repo, system, &options)?;
             println!(
-                "generation {} → {} ({} op(s), {} phantom row(s), lock {})",
+                "generation {} → {} ({} op(s), {} phantom row(s), forge {}, bls {}, reaped {} gen(s), lock {})",
                 report.generation,
                 report.root.display(),
                 report.plan_ops,
                 report.phantom_rows,
+                report.forge,
+                report.bls_entries,
+                report.reaped.len(),
                 report.lockfile.display()
             );
             Ok(())
         }
-        Commands::Rollback { generation, rootfs } => {
+        Commands::Rollback {
+            generation,
+            rootfs,
+            boot_root,
+            bls_dir,
+        } => {
+            let (boot_root, bls_dir) = bls_modes(boot_root, bls_dir)?;
             let rootfs = require_rootfs(rootfs)?;
             let target = RollbackTarget::parse(generation.as_deref())?;
-            let bls = bls_dir();
-            rollback(&rootfs, target, bls.as_deref())?;
+            rollback(&rootfs, target, boot_root.as_deref(), bls_dir.as_deref())?;
             Ok(())
         }
-        Commands::Run { profile } => {
-            tracing::info!("instanz run: {profile}");
-            todo!("M10: Container runtime")
+        Commands::Run {
+            profile,
+            rootfs,
+            level,
+            backend,
+            program,
+            config,
+            allow_privileged,
+            args,
+        } => {
+            let rootfs = require_rootfs(rootfs)?;
+            // The repository is a *profile lookup* source, not a runtime
+            // requirement: opening it lazily (only when a config was named)
+            // keeps `instanz run` from creating `/repository` as a side effect.
+            let repo = match &config {
+                Some(_) => Some(open_repo(&cli.repository, algo)?),
+                None => None,
+            };
+            let options = run::RunOptions {
+                rootfs: &rootfs,
+                profile: &profile,
+                level,
+                backend: backend.as_deref(),
+                program: program.as_deref(),
+                args: &args,
+                config: config.as_deref(),
+                allow_privileged,
+            };
+            let code = run::run(repo.as_ref(), &options)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Commands::Shell { config } => {
             tracing::info!("instanz shell: {config}");
@@ -215,15 +326,18 @@ fn main() -> anyhow::Result<()> {
         Commands::Gc {
             keep_generations,
             rootfs,
+            boot_root,
+            bls_dir,
         } => {
+            let (boot_root, bls_dir) = bls_modes(boot_root, bls_dir)?;
             let rootfs = require_rootfs(rootfs)?;
             let repo = open_repo(&cli.repository, algo)?;
-            let bls = bls_dir();
             let report = gc(
                 &repo,
                 &rootfs,
                 keep_generations as usize,
-                bls.as_deref(),
+                boot_root.as_deref(),
+                bls_dir.as_deref(),
             )?;
             println!(
                 "gc: {} generation(s), {} object(s) purged",

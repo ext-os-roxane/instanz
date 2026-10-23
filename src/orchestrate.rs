@@ -6,7 +6,8 @@
 //!
 //! * mapping a [`SystemConfig`] to CAS refs and a dry [`VfsPlan`] (evaluate);
 //! * the transactional order of an apply: fetch → snapshot → weave → phantom →
-//!   post-weave tools → lockfile → generation record → `current` switch;
+//!   post-weave tools → **runlevel-0 forge** → lockfile → generation record →
+//!   `current` switch → orphan sweep;
 //! * generation listing, rollback and two-stage garbage collection.
 //!
 //! The pipeline is synchronous on purpose: `libextos::ingest` uses
@@ -17,13 +18,33 @@
 //! nothing here hardcodes a production layout. The two documented production
 //! mappings live at the CLI edge: `/repository` and
 //! `/config/systems/default.nix`.
+//!
+//! # Runlevel-0 forge trigger (PLAN 4.2.6)
+//!
+//! Step 10 hands the woven system to [`crate::forge::run_forge`], which derives a
+//! Forge blueprint from the config (the derivation table lives in that module's
+//! docs) and adds two things `apply` never had in Phase 2: an initramfs built
+//! inside the forge namespace, and the BLS entry matrix under the caller's boot
+//! root (`--boot-root` / `EXTOS_BLS_ROOT`), including the `loader.conf`
+//! `CreateIfMissing` policy. A forge that cannot run is recorded as
+//! `forge=skipped` in the generation description and never fails the apply; a
+//! forge that *fails* is fatal, because it means the blueprint or the generator
+//! is wrong. `EXTOS_BLS_DIR` keeps its Phase-2 meaning (a raw entries directory
+//! with `gen-<n>.conf` snapshot entries) and does not forge.
+//!
+//! Step 11 ends with [`crate::reaper::reap`], which removes `gen-<n>` orphans
+//! left by aborted applies (never the current generation, never a recorded one,
+//! never one a BLS entry points at, never the youngest on disk). `EXTOS_REAPER=off`
+//! disables it; deletion failures are logged and non-fatal.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
+use libextos::anchor::AnchorPolicy;
 use libextos::cas::{hash_bytes, CasRepository, LockEntry};
+use libextos::forge::bls::{entries_dir as bls_entries_dir, set_loader_default};
 use libextos::config;
 use libextos::ingest;
 use libextos::manifest::PackageManifest;
@@ -35,7 +56,12 @@ use libextos::weaver::{
     self, CasRef, DagNode, DepGraph, LinkStrategy, OriginPriority, VfsPlan,
 };
 
-use crate::system::SystemConfig;
+use crate::forge::{self, ForgeReport, ForgeRequest, PackageSource};
+use crate::mount::{
+    apply_mounts, plan_mounts, probe_mount_capability, HostMountRunner, MountOutcome, MountSources,
+};
+use crate::reaper::{self, ReapReport};
+use crate::system::{ExpandedPackages, SystemConfig};
 
 /// Parse the `--hash-algo` spelling used by `pkt` into a [`HashAlgorithm`].
 pub fn parse_hash_algo(value: &str) -> HashAlgorithm {
@@ -83,6 +109,8 @@ impl ResolvedRef {
 pub struct Evaluation {
     /// The system config that was evaluated.
     pub system: SystemConfig,
+    /// Groups/virtuals flattened into concrete refs (PLAN 4.1.2).
+    pub expansion: ExpandedPackages,
     /// Resolved packages, in declaration order.
     pub resolved: Vec<ResolvedRef>,
     /// Total dependency edges between the resolved packages.
@@ -105,9 +133,22 @@ impl Evaluation {
 /// This never touches a rootfs: it only reads refs/manifests and computes the
 /// plan, which is what makes `instanz evaluate` a safe dry run.
 pub fn evaluate(repo: &CasRepository, system: SystemConfig) -> anyhow::Result<Evaluation> {
-    if system.packages.is_empty() {
+    let expansion = system.expand(repo)?;
+    evaluate_expanded(repo, system, expansion)
+}
+
+/// [`evaluate`] with an already-expanded package list (PLAN 4.1.2).
+///
+/// `apply` expands once so the fetch step and the plan agree on the exact ref
+/// set; a second expansion could otherwise observe a CAS that changed mid-apply.
+fn evaluate_expanded(
+    repo: &CasRepository,
+    system: SystemConfig,
+    expansion: ExpandedPackages,
+) -> anyhow::Result<Evaluation> {
+    if expansion.refs.is_empty() {
         bail!(
-            "{}: `packages` is empty — nothing to evaluate",
+            "{}: `packages` expands to nothing — nothing to evaluate",
             system.path.display()
         );
     }
@@ -115,11 +156,11 @@ pub fn evaluate(repo: &CasRepository, system: SystemConfig) -> anyhow::Result<Ev
     let native_pm = system
         .roof_native_pm
         .clone()
-        .or_else(|| majority_origin(&system.packages));
+        .or_else(|| majority_origin(&expansion.refs));
 
-    let mut resolved = Vec::with_capacity(system.packages.len());
+    let mut resolved = Vec::with_capacity(expansion.refs.len());
     let mut graph = DepGraph::new();
-    for reference in &system.packages {
+    for reference in &expansion.refs {
         let hash = repo
             .resolve_ref(&reference.origin, &reference.name, &reference.version)
             .with_context(|| {
@@ -166,16 +207,18 @@ pub fn evaluate(repo: &CasRepository, system: SystemConfig) -> anyhow::Result<Ev
         edges += row.deps;
     }
 
-    let plan = weaver::plan_from_refs_with(
+    let plan = weaver::plan::plan_from_refs_with_anchors(
         repo,
-        &system.packages,
+        &expansion.refs,
         LinkStrategy::Reflink,
         &OriginPriority::new(),
+        &AnchorPolicy::new(),
     )
     .with_context(|| format!("cannot plan {}", system.path.display()))?;
 
     Ok(Evaluation {
         system,
+        expansion,
         resolved,
         edges,
         plan,
@@ -184,7 +227,7 @@ pub fn evaluate(repo: &CasRepository, system: SystemConfig) -> anyhow::Result<Ev
 }
 
 /// Load and parse the manifest stored for `hash`.
-fn load_manifest(repo: &CasRepository, hash: &str) -> anyhow::Result<PackageManifest> {
+pub(crate) fn load_manifest(repo: &CasRepository, hash: &str) -> anyhow::Result<PackageManifest> {
     let text = repo.read_manifest(hash)?;
     let value = config::parse_nix(&text)
         .with_context(|| format!("cannot parse manifest.nix of object {}", short_hash(hash)))?;
@@ -212,6 +255,18 @@ pub fn print_evaluation(eval: &Evaluation, repo: &CasRepository) {
     println!("System        : {}", eval.system.name);
     println!("Config        : {}", eval.system.path.display());
     println!("Repository    : {}", repo.root.display());
+    // Declared entries (groups/virtuals included) vs. the flattened ref set.
+    println!(
+        "Declared      : {} entr(ies) [{}] — {} directly declared ref(s)",
+        eval.system.entries.len(),
+        eval.system
+            .entries
+            .iter()
+            .map(|entry| entry.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+        eval.system.packages.len()
+    );
     match &eval.native_pm {
         Some(pm) => println!("Roof native PM: {pm}"),
         None => println!("Roof native PM: none"),
@@ -221,6 +276,35 @@ pub fn print_evaluation(eval: &Evaluation, repo: &CasRepository) {
     }
     if !eval.system.services.is_empty() {
         println!("Services      : {}", eval.system.services.join(", "));
+    }
+    if let Some(boot) = eval.system.boot.cmdline.as_deref() {
+        println!("Boot cmdline  : {boot}");
+    }
+    if !eval.system.boot.modules.is_empty() {
+        println!("Boot modules  : {}", eval.system.boot.modules.join(", "));
+    }
+    if !eval.expansion.groups.is_empty() {
+        let groups = eval
+            .expansion
+            .groups
+            .iter()
+            .map(|(name, count)| format!("@{name} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Groups        : {groups}");
+    }
+    if !eval.expansion.virtuals.is_empty() {
+        let virtuals = eval
+            .expansion
+            .virtuals
+            .iter()
+            .map(|(name, reference)| format!("{name} → {}", reference.label()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Virtuals      : {virtuals}");
+    }
+    for note in &eval.expansion.notes {
+        println!("  note: {note}");
     }
     println!();
     println!(
@@ -255,6 +339,29 @@ pub fn print_evaluation(eval: &Evaluation, repo: &CasRepository) {
     for warning in plan.warnings() {
         println!("  note: {warning}");
     }
+
+    let anchors = plan.anchors();
+    if !anchors.is_empty() {
+        println!();
+        println!("SONAME anchors ({}):", anchors.len());
+        for choice in anchors.choices() {
+            let losers = choice.losers();
+            if losers.is_empty() {
+                println!(
+                    "  {} → {} (priority {}, sole provider)",
+                    choice.soname, choice.winner, choice.priority
+                );
+            } else {
+                println!(
+                    "  {} → {} (priority {}, over {})",
+                    choice.soname,
+                    choice.winner,
+                    choice.priority,
+                    losers.join(", ")
+                );
+            }
+        }
+    }
 }
 
 // ─── Apply ──────────────────────────────────────────────────────
@@ -265,8 +372,16 @@ pub struct ApplyOptions<'a> {
     pub rootfs: &'a Path,
     /// Repository download cache (stale `.part` files are swept on failure).
     pub cache_dir: &'a Path,
-    /// BLS entries directory; `None` keeps apply symlink-only.
+    /// Legacy BLS entries directory (`EXTOS_BLS_DIR`): snapshot-only
+    /// `gen-<n>.conf` entries, no forge. `None` keeps apply symlink-only.
     pub bls_dir: Option<&'a Path>,
+    /// Boot root for the runlevel-0 forge (`--boot-root` / `EXTOS_BLS_ROOT`):
+    /// the initramfs artifact and the BLS matrix land here.
+    pub boot_root: Option<&'a Path>,
+    /// Scratch root the forge tmpfs is staged under (`EXTOS_FORGE_SCRATCH`).
+    pub forge_scratch: &'a Path,
+    /// `/var` + `/home` mount sources (PLAN 4.1.5). Defaults to no mounts.
+    pub mounts: &'a MountSources,
 }
 
 /// What one successful apply produced.
@@ -282,14 +397,22 @@ pub struct ApplyReport {
     pub phantom_rows: usize,
     /// Lockfile written into the generation.
     pub lockfile: PathBuf,
+    /// `forged` / `skipped` / `n/a` — the forge phase token, as recorded.
+    pub forge: String,
+    /// BLS entries the forge wrote or confirmed (0 when it did not run).
+    pub bls_entries: usize,
+    /// Orphan generation directories the sweep removed.
+    pub reaped: Vec<u64>,
 }
 
 /// Execute the full local pipeline for `system`.
 ///
 /// Order (a failure never deletes the snapshot created before the weave):
-/// 1. evaluate; 2. fetch+ingest missing refs; 3. snapshot/prime `gen-<n>`;
-/// 4. plan; 5. execute; 6. phantom rows; 7. `ldconfig`/`depmod`;
-/// 8. lockfile + generation record + `current` switch.
+/// 1. expand groups/virtual refs; 2. fetch+ingest missing refs; 3. plan;
+/// 4. snapshot/prime `gen-<n>`; 5. weave; 6. seed `/etc`; 7. phantom rows;
+/// 8. `/var`+`/home` mounts; 9. `ldconfig`/`depmod`; 10. runlevel-0 forge
+/// (initramfs + BLS matrix, PLAN 4.2.6); 11. lockfile + generation record +
+/// `current` switch + orphan sweep (PLAN 4.1.1 – 4.1.6).
 pub fn apply(repo: &CasRepository, system: SystemConfig, opts: &ApplyOptions<'_>) -> anyhow::Result<ApplyReport> {
     match apply_inner(repo, system, opts) {
         Ok(report) => Ok(report),
@@ -308,14 +431,24 @@ fn apply_inner(
     system: SystemConfig,
     opts: &ApplyOptions<'_>,
 ) -> anyhow::Result<ApplyReport> {
-    const STEPS: usize = 8;
+    const STEPS: usize = 11;
 
-    println!("[1/{STEPS}] evaluate {}", system.path.display());
-    let missing = probe_missing(repo, &system.packages);
+    println!("[1/{STEPS}] expand {} (groups, virtual refs)", system.path.display());
+    let expansion = system.expand(repo)?;
+    for (group, count) in &expansion.groups {
+        println!("        @{group} → {count} package(s)");
+    }
+    for (virtual_ref, reference) in &expansion.virtuals {
+        println!("        {virtual_ref} → {}", reference.label());
+    }
+    for note in &expansion.notes {
+        println!("        note: {note}");
+    }
+    let missing = probe_missing(repo, &expansion.refs);
     println!(
-        "        {} declared ref(s), {} present, {} missing",
-        system.packages.len(),
-        system.packages.len() - missing.len(),
+        "        {} expanded ref(s), {} present, {} missing",
+        expansion.refs.len(),
+        expansion.refs.len() - missing.len(),
         missing.len()
     );
     for reference in &missing {
@@ -323,19 +456,19 @@ fn apply_inner(
     }
 
     println!("[2/{STEPS}] fetch missing packages");
-    let fetched = fetch_missing(repo, &system.packages, opts.cache_dir)?;
+    let fetched = fetch_missing(repo, &expansion.refs, opts.cache_dir)?;
     println!(
         "        {} fetched, {} already in the CAS",
         fetched,
-        system.packages.len() - fetched
+        expansion.refs.len() - fetched
     );
 
     // Full evaluation needs every manifest, so it runs after the fetch step.
-    println!("[3/{STEPS}] plan (reflink, origin priority)");
-    let eval = evaluate(repo, system)?;
+    println!("[3/{STEPS}] plan (reflink, origin priority, SONAME anchors)");
+    let eval = evaluate_expanded(repo, system, expansion)?;
     let plan = &eval.plan;
     println!(
-        "        {} node(s), {} edge(s), {} op(s) [dirs {}, files {}, symlinks {}, wrappers {}], collisions {}",
+        "        {} node(s), {} edge(s), {} op(s) [dirs {}, files {}, symlinks {}, wrappers {}], collisions {}, anchors {}",
         eval.node_count(),
         eval.edges,
         plan.len(),
@@ -343,8 +476,20 @@ fn apply_inner(
         plan.file_ops(),
         plan.symlink_ops(),
         plan.wrapper_ops(),
-        plan.collisions().len()
+        plan.collisions().len(),
+        plan.anchors().len()
     );
+    for choice in plan.anchors().choices() {
+        if !choice.losers().is_empty() {
+            println!(
+                "        anchor {} → {} (priority {}, over {})",
+                choice.soname,
+                choice.winner,
+                choice.priority,
+                choice.losers().join(", ")
+            );
+        }
+    }
 
     println!("[4/{STEPS}] snapshot before weave");
     let engine = SnapshotEngine::open(opts.rootfs)
@@ -378,41 +523,78 @@ fn apply_inner(
         execution.fallbacks
     );
 
-    println!("[6/{STEPS}] phantom rows");
+    println!("[6/{STEPS}] seed /etc from the woven packages");
+    let seeded = seed_etc(repo, &eval.resolved, &snapshot.path)
+        .context("/etc seeding failed")?;
+    println!(
+        "        {} seeded, {} kept (already present)",
+        seeded.seeded.len(),
+        seeded.skipped.len()
+    );
+    for warning in &seeded.warnings {
+        println!("        ⚠ {warning}");
+    }
+
+    println!("[7/{STEPS}] phantom rows");
     let phantom_rows = write_phantoms(repo, &eval, &snapshot.path)
         .context("phantom database generation failed")?;
     println!("        {phantom_rows} row(s) written");
 
-    println!("[7/{STEPS}] post-weave tools");
-    postprocess(&snapshot.path, eval.system.kernel.as_deref())?;
-    println!("        initramfs: deferred to Phase 4 (runlevel 0 forges, PLAN 4.2)");
+    println!("[8/{STEPS}] /var + /home mounts");
+    apply_roof_mounts(&snapshot.path, opts.mounts);
 
-    println!("[8/{STEPS}] lockfile + generation record");
+    println!("[9/{STEPS}] post-weave tools (ldconfig, depmod)");
+    postprocess(&snapshot.path, eval.system.kernel.as_deref())?;
+
+    println!("[10/{STEPS}] runlevel-0 forge (initramfs + BLS)");
+    let forge_report = run_forge_phase(repo, &eval, opts, number)?;
+
+    println!("[11/{STEPS}] lockfile + generation record + orphan sweep");
     let lockfile = snapshot.path.join(".lock");
-    let entries = resolve_locks(repo, &eval.system.packages)?;
+    let entries = resolve_locks(repo, &eval.expansion.refs)?;
     repo.write_lockfile(&entries, &lockfile)
         .with_context(|| format!("cannot write {}", lockfile.display()))?;
     let lock_bytes = fs::read(&lockfile)?;
     let lock_hash = hash_bytes(&lock_bytes, repo.algo);
+    let forge_token = forge_report
+        .as_ref()
+        .map_or("n/a", |report| report.phase.summary())
+        .to_string();
+    let bls_entries = forge_report.as_ref().map_or(0, ForgeReport::bls_entries);
     tracker.record(
         number,
         Some(lock_hash),
-        &format!("instanz apply: {} package(s)", entries.len()),
+        &format!(
+            "instanz apply: {} package(s), forge={forge_token}, bls={bls_entries}",
+            entries.len()
+        ),
     )?;
 
-    if let Some(entries_dir) = opts.bls_dir {
+    if forge_report.as_ref().is_some_and(|report| report.bls.is_some()) {
+        println!("        BLS entries: written by the forge phase above");
+    } else if opts.boot_root.is_some() {
+        println!(
+            "        BLS entries skipped: the forge produced no initramfs (its reason is printed above)"
+        );
+    } else if let Some(entries_dir) = opts.bls_dir {
         write_bls_entry(entries_dir, &eval.system, number)?;
         println!("        BLS entry {}/gen-{number}.conf", entries_dir.display());
     } else {
-        println!("        BLS entry skipped: EXTOS_BLS_DIR is not set (symlink-only mode)");
+        println!(
+            "        BLS entry skipped: neither --boot-root/EXTOS_BLS_ROOT nor EXTOS_BLS_DIR is set \
+             (symlink-only mode)"
+        );
     }
 
     engine
         .switch_to(number)
         .with_context(|| format!("cannot switch `current` to gen-{number}"))?;
     println!("        ✓ generation {number} is now current");
+
+    let reap = reap_orphans(opts)?;
+
     println!(
-        "✓ applied {} → {} ({} op(s), {} phantom row(s))",
+        "✓ applied {} → {} ({} op(s), {} phantom row(s), forge {forge_token})",
         eval.system.name,
         snapshot.path.display(),
         execution.journal.len(),
@@ -425,7 +607,95 @@ fn apply_inner(
         plan_ops: execution.journal.len(),
         phantom_rows,
         lockfile,
+        forge: forge_token,
+        bls_entries,
+        reaped: reap.removed,
     })
+}
+
+/// Run the runlevel-0 forge phase for the generation that was just woven.
+///
+/// `None` means "there was nothing to forge into": no boot root configured (or
+/// the legacy `EXTOS_BLS_DIR` snapshot-entry mode). The reason is printed so an
+/// operator never wonders why no initramfs appeared.
+fn run_forge_phase(
+    repo: &CasRepository,
+    eval: &Evaluation,
+    opts: &ApplyOptions<'_>,
+    number: u64,
+) -> anyhow::Result<Option<ForgeReport>> {
+    let Some(boot_root) = opts.boot_root else {
+        match opts.bls_dir {
+            Some(entries) => println!(
+                "        ⚠ forge skipped: EXTOS_BLS_DIR ({}) is the legacy snapshot-entry mode; \
+                 set --boot-root/EXTOS_BLS_ROOT to forge an initramfs",
+                entries.display()
+            ),
+            None => println!(
+                "        ⚠ forge skipped: no boot root configured (--boot-root / EXTOS_BLS_ROOT)"
+            ),
+        }
+        return Ok(None);
+    };
+
+    let labels: Vec<String> = eval.resolved.iter().map(ResolvedRef::label).collect();
+    let packages: Vec<PackageSource<'_>> = eval
+        .resolved
+        .iter()
+        .zip(&labels)
+        .map(|(row, label)| PackageSource {
+            label,
+            hash: &row.hash,
+        })
+        .collect();
+
+    let request = ForgeRequest {
+        boot_root,
+        scratch: opts.forge_scratch,
+        generation: number,
+        system: &eval.system.name,
+        kernel: eval.system.kernel.as_deref(),
+        modules: &eval.system.boot.modules,
+        cmdline: eval.system.boot.cmdline.as_deref(),
+        initrd: eval.system.boot.initrd.as_deref(),
+        linux: eval.system.linux.as_deref(),
+        packages: &packages,
+    };
+    let report = forge::run_forge(repo, &request)?;
+    Ok(Some(report))
+}
+
+/// BLS entries directory the sweep must protect, whichever mode is configured.
+fn configured_entries_dir(opts: &ApplyOptions<'_>) -> Option<PathBuf> {
+    match (opts.boot_root, opts.bls_dir) {
+        (Some(boot), _) => Some(bls_entries_dir(boot)),
+        (None, Some(entries)) => Some(entries.to_path_buf()),
+        (None, None) => None,
+    }
+}
+
+/// Remove orphan generations, announcing every removal (never fatal).
+fn reap_orphans(opts: &ApplyOptions<'_>) -> anyhow::Result<ReapReport> {
+    let entries = configured_entries_dir(opts);
+    let report = reaper::reap(opts.rootfs, entries.as_deref())?;
+    for number in &report.removed {
+        println!(
+            "        ✓ reaped gen-{number} (orphan: no generation record, not current, no BLS entry)"
+        );
+    }
+    for error in &report.errors {
+        println!("        ✗ could not reap {error}");
+    }
+    if report.disabled {
+        println!("        orphan sweep: {}", report.summary());
+    } else {
+        println!(
+            "        orphan sweep: {} ({} referenced generation(s) protected)",
+            report.summary(),
+            report.referenced.len()
+        );
+    }
+    Ok(report)
 }
 
 /// Highest of "tracker says next" and "newest generation on disk + 1".
@@ -580,6 +850,208 @@ fn write_bls_entry(entries_dir: &Path, system: &SystemConfig, number: u64) -> an
     Ok(())
 }
 
+// ─── /etc seeding (PLAN 4.1.4) ──────────────────────────────────
+
+/// One packaged file under `/etc` inside a CAS object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcFile {
+    /// Path relative to the roof root (`etc/…`).
+    pub rel_path: PathBuf,
+    /// Absolute source path inside the CAS object.
+    pub source: PathBuf,
+    /// Provider label, `origin/name`.
+    pub provider: String,
+    /// Whether the payload is a symlink (copied as a symlink, not dereferenced).
+    pub is_symlink: bool,
+}
+
+/// A seeded-or-skipped `/etc` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedSkip {
+    /// Path relative to the roof root.
+    pub rel_path: PathBuf,
+    /// Provider that shipped the file.
+    pub provider: String,
+    /// Why the file was not written (PLAN 4.1.4: never overwrite).
+    pub reason: String,
+}
+
+/// Result of [`seed_etc`].
+#[derive(Debug, Clone, Default)]
+pub struct SeedOutcome {
+    /// Files written into the roof's `etc`.
+    pub seeded: Vec<PathBuf>,
+    /// Files left untouched because the destination already existed.
+    pub skipped: Vec<SeedSkip>,
+    /// Operator-facing warnings, one per skip plus any unreadable payload.
+    pub warnings: Vec<String>,
+}
+
+/// Enumerate the packaged files under `/etc` in one CAS object (PLAN 4.1.4).
+///
+/// Walks `objects/<hash>/content/etc/…` without following symlinks: an in-package
+/// link is reported with `is_symlink` so seeding recreates the link instead of
+/// copying its target. Directories are implicit (created by the caller).
+pub fn etc_files_in_object(
+    repo: &CasRepository,
+    hash: &str,
+    provider: &str,
+) -> anyhow::Result<Vec<EtcFile>> {
+    let etc_root = repo.object_path(hash).join("content").join("etc");
+    let mut files = Vec::new();
+    if !etc_root.is_dir() {
+        return Ok(files);
+    }
+    let mut pending = vec![etc_root.clone()];
+    while let Some(dir) = pending.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("cannot read packaged {} under {}", dir.display(), hash)))
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let rel_path = path
+                .strip_prefix(repo.object_path(hash).join("content"))
+                .map_err(|_| anyhow!("packaged file {} escaped its object", path.display()))?
+                .to_path_buf();
+            files.push(EtcFile {
+                rel_path,
+                source: path,
+                provider: provider.to_string(),
+                is_symlink: file_type.is_symlink(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(files)
+}
+
+/// Seed default `/etc` files from the woven packages into the roof (PLAN 4.1.4).
+///
+/// Conflict rule: a seeded file is written **only if the destination does not
+/// exist**. An existing file is assumed to be edited or system-provided and is
+/// never overwritten; the skip is recorded in [`SeedOutcome::skipped`] and a
+/// warning is printed/logged. Symlinks shipped by a package are recreated as
+/// symlinks so `etc/alternatives`-style layouts survive.
+pub fn seed_etc(
+    repo: &CasRepository,
+    resolved: &[ResolvedRef],
+    root: &Path,
+) -> anyhow::Result<SeedOutcome> {
+    let mut outcome = SeedOutcome::default();
+    if !root.is_dir() {
+        bail!("/etc seeding: roof root {} is not a directory", root.display());
+    }
+
+    for row in resolved {
+        for file in etc_files_in_object(repo, &row.hash, &row.label())? {
+            let destination = root.join(&file.rel_path);
+            if destination.symlink_metadata().is_ok() {
+                let reason = "destination already exists; kept (never overwritten)".to_string();
+                outcome.warnings.push(format!(
+                    "etc seed skipped {} ({}): {reason}",
+                    file.rel_path.display(),
+                    file.provider
+                ));
+                outcome.skipped.push(SeedSkip {
+                    rel_path: file.rel_path,
+                    provider: file.provider,
+                    reason,
+                });
+                continue;
+            }
+            match seed_one(&file, &destination) {
+                Ok(()) => outcome.seeded.push(file.rel_path),
+                Err(err) => {
+                    let reason = err.to_string();
+                    outcome.warnings.push(format!(
+                        "etc seed failed {} ({}): {reason}",
+                        file.rel_path.display(),
+                        file.provider
+                    ));
+                    outcome.skipped.push(SeedSkip {
+                        rel_path: file.rel_path,
+                        provider: file.provider,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Copy one packaged `/etc` file into place (parent directories created).
+fn seed_one(file: &EtcFile, destination: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    if file.is_symlink {
+        let target = fs::read_link(&file.source)
+            .with_context(|| format!("cannot read link {}", file.source.display()))?;
+        std::os::unix::fs::symlink(&target, destination).with_context(|| {
+            format!(
+                "cannot seed link {} → {}",
+                destination.display(),
+                target.display()
+            )
+        })?;
+    } else {
+        fs::copy(&file.source, destination).with_context(|| {
+            format!(
+                "cannot seed {} from {}",
+                destination.display(),
+                file.source.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+// ─── Mounts wiring (PLAN 4.1.5) ─────────────────────────────────
+
+/// Assemble and (when permitted) apply the roof's `/var` + `/home` mounts.
+///
+/// Never fails the apply: a capability skip is announced with its reason and the
+/// spec list is printed so the operator can run the mounts later. Returns the
+/// outcome so callers/tests can assert it.
+fn apply_roof_mounts(root: &Path, sources: &MountSources) -> MountOutcome {
+    let specs = plan_mounts(root, sources);
+    let capability = probe_mount_capability();
+    if specs.is_empty() {
+        println!("        no mount sources declared (var/home stay generation-local)");
+        return MountOutcome::default();
+    }
+    if let Some(reason) = capability.reason() {
+        println!("        mounts not applied: {reason}");
+    }
+    let outcome = apply_mounts(&specs, &capability, &HostMountRunner);
+    for spec in &outcome.applied {
+        println!("        ✓ mounted {}", spec.label());
+    }
+    for skip in &outcome.skipped {
+        println!("        ⚠ skipped {}: {}", skip.spec.label(), skip.reason);
+    }
+    for failure in &outcome.failed {
+        println!("        ✗ failed {}: {}", failure.spec.label(), failure.reason);
+    }
+    if outcome.all_applied() && !outcome.applied.is_empty() {
+        println!("        ✓ all {} mount(s) applied", outcome.applied.len());
+    }
+    outcome
+}
+
 /// Run the strict post-weave tools, announcing every skip explicitly.
 fn postprocess(root: &Path, kernel: Option<&str>) -> anyhow::Result<()> {
     match weaver::run_ldconfig(root) {
@@ -676,9 +1148,19 @@ impl RollbackTarget {
 }
 
 /// Switch `current` (and the BLS default, when configured) to an older generation.
+///
+/// Two boot-entry layouts are understood, mirroring `apply`:
+///
+/// * `boot_root` (`--boot-root` / `EXTOS_BLS_ROOT`): point `loader.conf` at the
+///   forge matrix entry `extos-<system>-g<n>-<kernel>.conf` for the generation.
+///   If the forge never wrote one (skipped, or no `linux = "…"`), the default
+///   is left alone with a printed reason rather than pointing at a missing file.
+/// * `bls_dir` (`EXTOS_BLS_DIR`): the Phase-2 snapshot layout, whose entry is
+///   always `gen-<n>.conf`.
 pub fn rollback(
     rootfs: &Path,
     target: RollbackTarget,
+    boot_root: Option<&Path>,
     bls_dir: Option<&Path>,
 ) -> anyhow::Result<u64> {
     let engine = SnapshotEngine::open(rootfs)
@@ -724,15 +1206,83 @@ pub fn rollback(
         .with_context(|| format!("cannot switch `current` to gen-{target_number}"))?;
     println!("rollback: generation {from} → {target_number} ({title})");
 
-    match bls_dir {
-        Some(dir) => {
+    match (boot_root, bls_dir) {
+        (Some(boot), _) => {
+            let entries = bls_entries_dir(boot);
+            match bls_entry_for_generation(&entries, target_number) {
+                Some(id) => {
+                    let conf = set_loader_default(boot, &id)?;
+                    println!("  BLS default {} → {id}", conf.display());
+                }
+                None => println!(
+                    "  BLS default skipped: no forge entry for gen-{target_number} under {}",
+                    entries.display()
+                ),
+            }
+        }
+        (None, Some(dir)) => {
             let conf = set_bls_default(dir, target_number)?;
             println!("  BLS default {} → {}", conf.display(), BlsEntry::file_name(target_number));
         }
-        None => println!("  BLS default skipped: EXTOS_BLS_DIR is not set (symlink-only mode)"),
+        (None, None) => println!("  BLS default skipped: EXTOS_BLS_DIR is not set (symlink-only mode)"),
     }
 
     Ok(target_number)
+}
+
+/// **Id** (file stem) of the BLS entry in `entries_dir` that belongs to `generation`.
+///
+/// Both layouts are accepted (`gen-<n>.conf` and the forge matrix
+/// `extos-<system>-g<n>-<kernel>.conf`); the lexicographically first match wins
+/// so a rollback is deterministic when several kernels carry the generation.
+/// The `.conf` suffix is stripped because `loader.conf` (`BlsPlan::write` and
+/// `set_loader_default`) names entries by id, not by file name.
+fn bls_entry_for_generation(entries_dir: &Path, generation: u64) -> Option<String> {
+    let mut matches: Vec<String> = fs::read_dir(entries_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| reaper::generation_from_entry_name(name) == Some(generation))
+        .filter_map(|name| name.strip_suffix(".conf").map(str::to_string))
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
+
+/// Remove forge matrix entries (`extos-…-g<n>-….conf`) for collected generations.
+///
+/// [`generation::gc_with_entries`] only knows the `gen-<n>.conf` snapshot shape;
+/// the forge matrix has one file per (system, kernel), so every file whose
+/// decoded generation was collected is removed. Missing entries are not errors.
+fn remove_forge_entries(entries_dir: &Path, removed: &[u64]) -> Vec<String> {
+    if removed.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(entries_dir) else {
+        return Vec::new();
+    };
+    let mut errors = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("extos-") {
+            continue;
+        }
+        let Some(number) = reaper::generation_from_entry_name(name) else {
+            continue;
+        };
+        if !removed.contains(&number) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    errors
 }
 
 /// Point the boot loader's default at `gen-<n>.conf`.
@@ -787,14 +1337,18 @@ pub fn gc(
     repo: &CasRepository,
     rootfs: &Path,
     keep: usize,
+    boot_root: Option<&Path>,
     bls_dir: Option<&Path>,
 ) -> anyhow::Result<GcReport> {
     println!("stage 1/2: generations (keep {keep})");
     let engine = SnapshotEngine::open(rootfs)
         .with_context(|| format!("cannot open generations root {}", rootfs.display()))?;
     let mut tracker = GenerationTracker::open(rootfs)?;
+    let entries = boot_root
+        .map(bls_entries_dir)
+        .or_else(|| bls_dir.map(Path::to_path_buf));
     let generation_result =
-        generation::gc_with_entries(&engine, &mut tracker, keep, bls_dir);
+        generation::gc_with_entries(&engine, &mut tracker, keep, entries.as_deref());
 
     let mut report = GcReport::default();
     let mut generation_error = None;
@@ -809,6 +1363,13 @@ pub fn gc(
                     format!(": {}", removed.iter().map(|n| format!("gen-{n}")).collect::<Vec<_>>().join(", "))
                 }
             );
+            // The forge matrix is per (system, kernel): `gc_with_entries` cannot
+            // know those file names, so they are pruned here.
+            if let Some(dir) = &entries {
+                for error in remove_forge_entries(dir, &removed) {
+                    eprintln!("  warning: could not remove forge BLS entry {error}");
+                }
+            }
             report.generations = removed;
         }
         Err(err) => {
@@ -1008,6 +1569,70 @@ mod tests {
     }
 
     #[test]
+    fn rollback_in_boot_root_mode_defaults_to_the_forge_matrix_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("system");
+        let boot = tmp.path().join("boot");
+        let entries = bls_entries_dir(&boot);
+        fs::create_dir_all(&entries).unwrap();
+
+        let engine = SnapshotEngine::open(&rootfs).unwrap();
+        engine.create_empty(1).unwrap();
+        engine.create_empty(2).unwrap();
+        engine.switch_to(2).unwrap();
+        let mut tracker = GenerationTracker::open(&rootfs).unwrap();
+        tracker.record(1, None, "first").unwrap();
+        tracker.record(2, None, "second").unwrap();
+
+        fs::write(
+            entries.join("extos-fixture-g1-6.11.0-extos.conf"),
+            "title gen one\n",
+        )
+        .unwrap();
+        fs::write(
+            entries.join("extos-fixture-g2-6.11.0-extos.conf"),
+            "title gen two\n",
+        )
+        .unwrap();
+
+        let target = rollback(&rootfs, RollbackTarget::Previous, Some(&boot), None).unwrap();
+        assert_eq!(target, 1);
+        assert_eq!(engine.current_generation().unwrap(), Some(1));
+        let loader = fs::read_to_string(boot.join("loader/loader.conf")).unwrap();
+        assert_eq!(loader, "default extos-fixture-g1-6.11.0-extos\n");
+    }
+
+    #[test]
+    fn forge_entries_are_pruned_only_for_collected_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("loader/entries")).unwrap();
+        let entries = tmp.path().join("loader/entries");
+        for name in [
+            "extos-fixture-g1-6.11.0-extos.conf",
+            "extos-fixture-g2-6.11.0-extos.conf",
+            "extos-fixture-g1-6.6.1-lts.conf",
+            "gen-1.conf",
+            "notes.txt",
+        ] {
+            fs::write(entries.join(name), "x\n").unwrap();
+        }
+
+        let errors = remove_forge_entries(&entries, &[1]);
+        assert!(errors.is_empty(), "{errors:?}");
+        // Both kernels of the collected generation are gone…
+        assert!(!entries.join("extos-fixture-g1-6.11.0-extos.conf").exists());
+        assert!(!entries.join("extos-fixture-g1-6.6.1-lts.conf").exists());
+        // …everything else (other generation, legacy entry, unrelated file) stays.
+        assert!(entries.join("extos-fixture-g2-6.11.0-extos.conf").exists());
+        assert!(entries.join("gen-1.conf").exists());
+        assert!(entries.join("notes.txt").exists());
+
+        // Missing directory / empty removal list are not errors.
+        assert!(remove_forge_entries(&tmp.path().join("absent"), &[1]).is_empty());
+        assert!(remove_forge_entries(&entries, &[]).is_empty());
+    }
+
+    #[test]
     fn lock_packages_are_parsed_from_lockfile_text() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = tmp.path().join(".lock");
@@ -1021,5 +1646,246 @@ mod tests {
             vec!["archlinux/htop".to_string(), "debian/bash".to_string()]
         );
         assert!(read_lock_packages(&tmp.path().join("missing")).is_empty());
+    }
+
+    // ── 4.1.4 /etc seeding ─────────────────────────────────────
+
+    /// Publish a fixture package with the given `(rel path, contents)` files.
+    fn publish_fixture(
+        repo: &CasRepository,
+        origin: &str,
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> ResolvedRef {
+        let staging = tempfile::tempdir().unwrap();
+        let src = staging.path().join(name);
+        fs::create_dir_all(&src).unwrap();
+        for (rel, contents) in files {
+            let path = src.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let hash = repo.store_directory(&src).unwrap();
+        repo.write_manifest(
+            &hash,
+            &format!(
+                "{{ identity = {{ origin = \"{origin}\"; name = \"{name}\"; version = \"1.0\"; }}; }}"
+            ),
+        )
+        .unwrap();
+        repo.create_ref(origin, name, "1.0", &hash).unwrap();
+        ResolvedRef {
+            reference: CasRef::new(origin, name, "1.0"),
+            version: "1.0".to_string(),
+            hash,
+            deps: 0,
+        }
+    }
+
+    #[test]
+    fn etc_files_are_enumerated_from_the_cas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = CasRepository::open(tmp.path().join("repo"), HashAlgorithm::Blake3).unwrap();
+        let row = publish_fixture(
+            &repo,
+            "debian",
+            "base-files",
+            &[
+                ("etc/issue", "welcome\n"),
+                ("etc/ssh/sshd_config", "Port 22\n"),
+                ("usr/bin/hello", "#!/bin/sh\n"),
+            ],
+        );
+
+        let files = etc_files_in_object(&repo, &row.hash, &row.label()).unwrap();
+        let paths: Vec<&Path> = files.iter().map(|f| f.rel_path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![Path::new("etc/issue"), Path::new("etc/ssh/sshd_config")]
+        );
+        assert!(files.iter().all(|f| f.provider == "debian/base-files"));
+        assert!(files.iter().all(|f| !f.is_symlink));
+
+        // A package without /etc contributes nothing (not an error).
+        let row = publish_fixture(&repo, "debian", "bin-only", &[("usr/bin/x", "x")]);
+        assert!(etc_files_in_object(&repo, &row.hash, &row.label())
+            .unwrap()
+            .is_empty());
+        // A missing object is empty too, not a panic.
+        assert!(etc_files_in_object(&repo, "does-not-exist", "x/y")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn seeding_writes_absent_files_and_never_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = CasRepository::open(tmp.path().join("repo"), HashAlgorithm::Blake3).unwrap();
+        let a = publish_fixture(
+            &repo,
+            "debian",
+            "base-files",
+            &[
+                ("etc/issue", "debian issue\n"),
+                ("etc/profile.d/extos.sh", "export EXTOS=1\n"),
+            ],
+        );
+        let b = publish_fixture(
+            &repo,
+            "archlinux",
+            "filesystem",
+            &[("etc/issue", "arch issue\n"), ("etc/hosts", "127.0.0.1 localhost\n")],
+        );
+
+        let roof = tmp.path().join("roof");
+        fs::create_dir_all(roof.join("etc")).unwrap();
+        // The operator already edited /etc/issue.
+        fs::write(roof.join("etc/issue"), "hand-edited\n").unwrap();
+
+        let outcome = seed_etc(&repo, &[a, b], &roof).unwrap();
+
+        // The edited file is untouched.
+        assert_eq!(
+            fs::read_to_string(roof.join("etc/issue")).unwrap(),
+            "hand-edited\n"
+        );
+        // Its two packaged claims are both recorded as skips.
+        let skipped: Vec<&Path> = outcome.skipped.iter().map(|s| s.rel_path.as_path()).collect();
+        assert!(skipped.contains(&Path::new("etc/issue")), "{skipped:?}");
+        assert_eq!(
+            outcome
+                .skipped
+                .iter()
+                .filter(|s| s.rel_path == Path::new("etc/issue"))
+                .count(),
+            2,
+            "both providers must be reported"
+        );
+        assert!(outcome.skipped.iter().all(|s| s.reason.contains("never overwritten")));
+        assert_eq!(outcome.warnings.len(), outcome.skipped.len());
+
+        // Absent files are seeded with their packaged contents.
+        assert_eq!(
+            fs::read_to_string(roof.join("etc/profile.d/extos.sh")).unwrap(),
+            "export EXTOS=1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(roof.join("etc/hosts")).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
+        assert_eq!(outcome.seeded.len(), 2);
+    }
+
+    #[test]
+    fn seeding_recreates_packaged_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = CasRepository::open(tmp.path().join("repo"), HashAlgorithm::Blake3).unwrap();
+        let row = publish_fixture(&repo, "debian", "mime-support", &[]);
+        // Inject a packaged symlink, which `store_directory` would have copied
+        // as a regular file (it dereferences links).
+        let link = repo.object_path(&row.hash).join("content/etc/mime.types");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../usr/share/mime/types", &link).unwrap();
+
+        let roof = tmp.path().join("roof");
+        fs::create_dir_all(&roof).unwrap();
+        let outcome = seed_etc(&repo, &[row], &roof).unwrap();
+        assert!(outcome.seeded.contains(&PathBuf::from("etc/mime.types")));
+        // Seeded as a symlink, not as a copy of its target.
+        assert_eq!(
+            fs::read_link(roof.join("etc/mime.types")).unwrap(),
+            PathBuf::from("../usr/share/mime/types")
+        );
+        // Seeding a link does not materialize its target.
+        assert!(!roof.join("usr/share/mime/types").exists());
+    }
+
+    #[test]
+    fn seeding_requires_an_existing_roof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = CasRepository::open(tmp.path().join("repo"), HashAlgorithm::Blake3).unwrap();
+        let err = seed_etc(&repo, &[], &tmp.path().join("absent")).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    // ── 4.1.6 post-weave hooks ─────────────────────────────────
+
+    /// Serializes the tests that mutate tool-override environment variables.
+    static HOOK_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_stub(dir: &Path, name: &str, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        // Every invocation appends its argv to `log`, then succeeds.
+        fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn orchestrating_flow_invokes_ldconfig_and_depmod_stubs() {
+        let _guard = HOOK_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let roof = tmp.path().join("roof");
+        fs::create_dir_all(roof.join("usr/lib")).unwrap();
+
+        let ldconfig_log = tmp.path().join("ldconfig.log");
+        let depmod_log = tmp.path().join("depmod.log");
+        let ldconfig = write_stub(tmp.path(), "ldconfig-stub", &ldconfig_log);
+        let depmod = write_stub(tmp.path(), "depmod-stub", &depmod_log);
+
+        // SAFETY: guarded by HOOK_ENV; no other test reads these variables.
+        unsafe {
+            std::env::set_var("EXTOS_LDCONFIG", &ldconfig);
+            std::env::set_var("EXTOS_DEPMOD", &depmod);
+        }
+        let result = postprocess(&roof, Some("6.8.2-extos"));
+        unsafe {
+            std::env::remove_var("EXTOS_LDCONFIG");
+            std::env::remove_var("EXTOS_DEPMOD");
+        }
+        result.unwrap();
+
+        let ldconfig_args = fs::read_to_string(&ldconfig_log).unwrap();
+        assert_eq!(
+            ldconfig_args.trim(),
+            format!("-r {}", roof.display()),
+            "ldconfig must be chroot-scoped to the woven roof"
+        );
+        let depmod_args = fs::read_to_string(&depmod_log).unwrap();
+        assert_eq!(
+            depmod_args.trim(),
+            format!("-b {} 6.8.2-extos", roof.display())
+        );
+    }
+
+    #[test]
+    fn depmod_is_explicitly_skipped_without_a_kernel() {
+        let _guard = HOOK_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let roof = tmp.path().join("roof");
+        fs::create_dir_all(roof.join("usr/lib")).unwrap();
+
+        let ldconfig_log = tmp.path().join("ldconfig.log");
+        let depmod_log = tmp.path().join("depmod.log");
+        let ldconfig = write_stub(tmp.path(), "ldconfig-stub", &ldconfig_log);
+        let depmod = write_stub(tmp.path(), "depmod-stub", &depmod_log);
+        unsafe {
+            std::env::set_var("EXTOS_LDCONFIG", &ldconfig);
+            std::env::set_var("EXTOS_DEPMOD", &depmod);
+        }
+        let result = postprocess(&roof, None);
+        unsafe {
+            std::env::remove_var("EXTOS_LDCONFIG");
+            std::env::remove_var("EXTOS_DEPMOD");
+        }
+        result.unwrap();
+
+        assert!(ldconfig_log.exists(), "ldconfig still runs");
+        assert!(!depmod_log.exists(), "depmod must not run without a kernel");
     }
 }
