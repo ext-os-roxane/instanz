@@ -36,6 +36,21 @@
 //! left by aborted applies (never the current generation, never a recorded one,
 //! never one a BLS entry points at, never the youngest on disk). `EXTOS_REAPER=off`
 //! disables it; deletion failures are logged and non-fatal.
+//!
+//! # Service enable/disable (PLAN 7.2.2)
+//!
+//! Step 6 ends with a wants-dir reconcile ([`reconcile_services`]): every
+//! name declared in the config's `services` list gets a *relative*
+//! `etc/systemd/system/multi-user.target.wants/<name>.service` symlink into
+//! the roof's `/usr/lib/systemd/system` — the FHS location the weaver places
+//! packaged units at — provided the unit file exists in the roof's standard
+//! unit search path. A declared service whose unit is absent anywhere in the
+//! roof (its package is not woven) is an honest warning, never a failure.
+//! Services that were enabled by an earlier apply but are no longer declared
+//! are disabled; the bookkeeping marker
+//! (`etc/systemd/.extos-enabled-services`) makes apply touch *only* symlinks
+//! it created itself — operator- and tooling-owned wants entries are never
+//! removed, clobbered, or recorded (see [`ENABLED_SERVICES_MARKER`]).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -406,16 +421,23 @@ pub struct ApplyReport {
     /// Declared security applied to the roof (PLAN 6.2 glue): AppArmor
     /// profiles written, SELinux labels applied/refused.
     pub security: libextos::security::RoofSecurityReport,
+    /// Services enabled by this apply (PLAN 7.2.2): declared services whose
+    /// `multi-user.target.wants` symlink was created or confirmed.
+    pub services_enabled: usize,
+    /// Services disabled by this apply (PLAN 7.2.2): marker-recorded services
+    /// that are no longer declared.
+    pub services_disabled: usize,
 }
 
 /// Execute the full local pipeline for `system`.
 ///
 /// Order (a failure never deletes the snapshot created before the weave):
 /// 1. expand groups/virtual refs; 2. fetch+ingest missing refs; 3. plan;
-/// 4. snapshot/prime `gen-<n>`; 5. weave; 6. seed `/etc`; 7. phantom rows;
-/// 8. `/var`+`/home` mounts; 9. `ldconfig`/`depmod`; 10. runlevel-0 forge
-/// (initramfs + BLS matrix, PLAN 4.2.6); 11. lockfile + generation record +
-/// `current` switch + orphan sweep (PLAN 4.1.1 – 4.1.6).
+/// 4. snapshot/prime `gen-<n>`; 5. weave; 6. seed `/etc` + reconcile declared
+/// services (PLAN 7.2.2); 7. phantom rows; 8. `/var`+`/home` mounts;
+/// 9. `ldconfig`/`depmod`; 10. runlevel-0 forge (initramfs + BLS matrix,
+/// PLAN 4.2.6); 11. lockfile + generation record + `current` switch + orphan
+/// sweep (PLAN 4.1.1 – 4.1.6).
 pub fn apply(repo: &CasRepository, system: SystemConfig, opts: &ApplyOptions<'_>) -> anyhow::Result<ApplyReport> {
     match apply_inner(repo, system, opts) {
         Ok(report) => Ok(report),
@@ -538,6 +560,23 @@ fn apply_inner(
         println!("        ⚠ {warning}");
     }
 
+    // PLAN 7.2.2: declarative service enable/disable (wants-dir reconcile).
+    let services = reconcile_services(&snapshot.path, &eval.system.services)
+        .context("service enable/disable failed")?;
+    if services.relevant {
+        println!(
+            "        services: {} enabled, {} disabled, {} warning(s)",
+            services.enabled,
+            services.disabled,
+            services.warnings.len()
+        );
+        for warning in &services.warnings {
+            println!("        ⚠ {warning}");
+        }
+    } else {
+        println!("        services: none declared");
+    }
+
     println!("[7/{STEPS}] phantom rows");
     let phantom_rows = write_phantoms(repo, &eval, &snapshot.path)
         .context("phantom database generation failed")?;
@@ -649,12 +688,18 @@ fn apply_inner(
         bls_entries,
         reaped: reap.removed,
         security,
+        services_enabled: services.enabled,
+        services_disabled: services.disabled,
     };
     println!(
         "        security: {} apparmor profile(s), {} selinux label(s), {} skipped",
         report.security.apparmor_profiles.len(),
         report.security.selinux_applied,
         report.security.apparmor_skipped.len() + report.security.selinux_skipped.len()
+    );
+    println!(
+        "        services: {} enabled, {} disabled",
+        report.services_enabled, report.services_disabled
     );
 
     Ok(report)
@@ -1064,6 +1109,249 @@ fn seed_one(file: &EtcFile, destination: &Path) -> anyhow::Result<()> {
         })?;
     }
     Ok(())
+}
+
+// ─── Service enable/disable (PLAN 7.2.2) ────────────────────────
+
+/// Marker file (relative to the roof root) recording the service set the
+/// apply pipeline reconciles: `etc/systemd/.extos-enabled-services`.
+///
+/// # Contract
+///
+/// The marker is the *only* bookkeeping `instanz apply` owns inside the
+/// roof's `multi-user.target.wants` directory, and it makes apply touch
+/// **only** symlinks it created itself:
+///
+/// * On every apply, exactly the `wants/<name>.service` symlinks recorded in
+///   the marker whose name is no longer declared are removed, then the marker
+///   is rewritten (sorted, one name per line, byte-identical for an unchanged
+///   set) with the services this apply is responsible for: the declared set
+///   minus entries found operator-owned.
+/// * Symlinks that are **not** marker-recorded belong to the operator or to
+///   other tooling (e.g. `systemctl enable`): they are never removed, and a
+///   declared service whose wants entry already exists with a different
+///   target is left untouched with a warning instead of being clobbered —
+///   and it is *not* recorded, so a later apply can never delete it either.
+/// * A declared service whose unit file is missing is recorded without a
+///   symlink (it is warned about honestly), so a later apply that stops
+///   declaring it still sweeps the wants directory clean.
+///
+/// The marker lives inside the generation tree, so the disable semantics
+/// travel with snapshots: a generation that stops declaring a service loses
+/// the symlink, exactly like every other declarative bit.
+pub const ENABLED_SERVICES_MARKER: &str = "etc/systemd/.extos-enabled-services";
+
+/// Result of the PLAN 7.2.2 service reconcile pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceReconcileReport {
+    /// Declared services whose `multi-user.target.wants` symlink this apply
+    /// created or confirmed.
+    pub enabled: usize,
+    /// Marker-recorded services that are no longer declared (symlink removed,
+    /// or already absent).
+    pub disabled: usize,
+    /// Honest warnings: declared services without a unit file in the roof,
+    /// operator-owned wants entries left untouched.
+    pub warnings: Vec<String>,
+    /// Whether anything was reconciled at all (`services` declared or the
+    /// marker exists). A roof with neither gets a single honest
+    /// "none declared" line and no invented `etc/systemd` tree.
+    pub relevant: bool,
+}
+
+/// Validate a declared service name for path-safe use under
+/// `etc/systemd/system/multi-user.target.wants/` (systemd template
+/// instances keep their `@`, e.g. `sshd@console`).
+fn validate_service_name(service: &str) -> anyhow::Result<()> {
+    let ok = !service.is_empty()
+        && !service.contains("..")
+        && service
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'));
+    if ok {
+        Ok(())
+    } else {
+        bail!(
+            "invalid service name {service:?}: expected non-empty [a-zA-Z0-9._@-] without '..'"
+        )
+    }
+}
+
+/// Relative `multi-user.target.wants` symlink target for `<name>.service`,
+/// pointing at the FHS packaged-unit location `/usr/lib/systemd/system`
+/// *inside the same roof* (the roof root is four levels up from the wants
+/// directory). Relative targets survive roof relocation, exactly like the
+/// relative targets the weaver and the CAS virtual links use.
+fn wants_symlink_target(service: &str) -> String {
+    format!("../../../../usr/lib/systemd/system/{service}.service")
+}
+
+/// Locate `<name>.service` in the roof's standard systemd unit search path:
+/// `etc/systemd/system` (pipeline/operator units) first, then
+/// `usr/lib/systemd/system` — the FHS location the weaver places packaged
+/// units at. Existence is checked without dereferencing: a woven unit is
+/// often a symlink into the generation's payload.
+fn unit_in_roof(root: &Path, service: &str) -> Option<PathBuf> {
+    ["etc/systemd/system", "usr/lib/systemd/system"]
+        .iter()
+        .map(|dir| root.join(dir).join(format!("{service}.service")))
+        .find(|path| path.symlink_metadata().is_ok())
+}
+
+/// Synchronize the roof's declarative service set (PLAN 7.2.2).
+///
+/// For every name in `declared`,
+/// `<roof>/etc/systemd/system/multi-user.target.wants/<name>.service` is
+/// created as a *relative* symlink to the roof's
+/// `/usr/lib/systemd/system/<name>.service` — but only when the unit file
+/// exists in the roof's standard unit search path; a declared service whose
+/// unit is absent anywhere in the roof (its package is not woven) is an
+/// honest warning, not a failure. Previously enabled services that are no
+/// longer declared are disabled. See [`ENABLED_SERVICES_MARKER`] for the
+/// full marker contract and why non-marker-recorded symlinks are untouchable.
+///
+/// A roof with no declared services and no marker is left completely
+/// untouched (no `etc/systemd` tree is invented for it).
+pub fn reconcile_services(
+    root: &Path,
+    declared: &[String],
+) -> anyhow::Result<ServiceReconcileReport> {
+    for service in declared {
+        validate_service_name(service)?;
+    }
+    // [`ENABLED_SERVICES_MARKER`] is the marker path relative to the roof
+    // root; its parent is the systemd directory the wants tree hangs off.
+    let marker = root.join(ENABLED_SERVICES_MARKER);
+    let Some(systemd_dir) = marker.parent() else {
+        bail!("service marker {} has no parent directory", marker.display());
+    };
+    let wants_dir = systemd_dir.join("system").join("multi-user.target.wants");
+
+    let previous: Vec<String> = match fs::read_to_string(&marker) {
+        Ok(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "cannot read service enable marker {}",
+                marker.display()
+            )))
+        }
+    };
+
+    let mut declared_sorted = declared.to_vec();
+    declared_sorted.sort();
+    declared_sorted.dedup();
+
+    if declared_sorted.is_empty() && previous.is_empty() {
+        return Ok(ServiceReconcileReport::default());
+    }
+
+    let mut report = ServiceReconcileReport {
+        relevant: true,
+        ..Default::default()
+    };
+
+    // Disable pass: marker-recorded services that are no longer declared.
+    for name in &previous {
+        if declared_sorted.binary_search(name).is_ok() {
+            continue;
+        }
+        let link = wants_dir.join(format!("{name}.service"));
+        match fs::remove_file(&link) {
+            Ok(()) => {}
+            // A marker-recorded service can legitimately have no symlink
+            // (its unit was missing when it was last declared).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "cannot remove service enable symlink {}",
+                    link.display()
+                )))
+            }
+        }
+        report.disabled += 1;
+    }
+
+    // Enable pass: declared services get a relative wants-dir symlink.
+    let mut operator_owned: Vec<String> = Vec::new();
+    for name in &declared_sorted {
+        if unit_in_roof(root, name).is_none() {
+            report.warnings.push(format!(
+                "service {name}: declared but its unit file does not exist anywhere in the \
+                 roof's unit search path (etc/systemd/system/{name}.service and \
+                 usr/lib/systemd/system/{name}.service are both absent) — not enabled; \
+                 is its package woven?"
+            ));
+            continue;
+        }
+        let link = wants_dir.join(format!("{name}.service"));
+        let target = wants_symlink_target(name);
+        match fs::symlink_metadata(&link) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&wants_dir)
+                    .with_context(|| format!("cannot create {}", wants_dir.display()))?;
+                std::os::unix::fs::symlink(&target, &link).with_context(|| {
+                    format!("cannot enable service {name}: {} → {target}", link.display())
+                })?;
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "cannot inspect service enable symlink {}",
+                    link.display()
+                )))
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let existing = fs::read_link(&link).with_context(|| {
+                    format!("cannot read service enable symlink {}", link.display())
+                })?;
+                if existing != Path::new(&target) {
+                    // Operator- or tooling-owned entry (e.g. `systemctl
+                    // enable`): never clobbered, never marker-recorded, and
+                    // therefore never removed by a later apply.
+                    report.warnings.push(format!(
+                        "service {name}: {} already exists with target {} — left untouched \
+                         (operator-owned; not marker-recorded)",
+                        link.display(),
+                        existing.display()
+                    ));
+                    operator_owned.push(name.clone());
+                    continue;
+                }
+            }
+            Ok(_) => {
+                report.warnings.push(format!(
+                    "service {name}: {} exists and is not a symlink — left untouched \
+                     (operator-owned; not marker-recorded)",
+                    link.display()
+                ));
+                operator_owned.push(name.clone());
+                continue;
+            }
+        }
+        report.enabled += 1;
+    }
+
+    // Marker rewrite: the declared set minus operator-owned entries, sorted,
+    // one per line — byte-identical when the set did not change.
+    fs::create_dir_all(&systemd_dir)
+        .with_context(|| format!("cannot create {}", systemd_dir.display()))?;
+    let mut content = String::new();
+    for name in &declared_sorted {
+        if operator_owned.contains(name) {
+            continue;
+        }
+        content.push_str(name);
+        content.push('\n');
+    }
+    fs::write(&marker, content)
+        .with_context(|| format!("cannot write service enable marker {}", marker.display()))?;
+
+    Ok(report)
 }
 
 // ─── Mounts wiring (PLAN 4.1.5) ─────────────────────────────────
@@ -1853,6 +2141,177 @@ mod tests {
         let repo = CasRepository::open(tmp.path().join("repo"), HashAlgorithm::Blake3).unwrap();
         let err = seed_etc(&repo, &[], &tmp.path().join("absent")).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    // ── 7.2.2 service enable/disable ───────────────────────────
+
+    /// A roof whose woven tree ships the given `<name>.service` units.
+    fn roof_with_units(services: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit_dir = tmp.path().join("usr/lib/systemd/system");
+        for name in services {
+            let unit = unit_dir.join(format!("{name}.service"));
+            fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            fs::write(unit, "[Unit]\nDescription=stub\n").unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn service_reconcile_enables_declared_services_with_relative_symlinks() {
+        let tmp = roof_with_units(&["sshd"]);
+        let roof = tmp.path();
+
+        let report = reconcile_services(roof, &["sshd".to_string()]).unwrap();
+        assert!(report.relevant);
+        assert_eq!(report.enabled, 1);
+        assert_eq!(report.disabled, 0);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        let link = roof
+            .join("etc/systemd/system/multi-user.target.wants")
+            .join("sshd.service");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("../../../../usr/lib/systemd/system/sshd.service"),
+            "the wants symlink must be relative and resolve inside the same roof"
+        );
+        // The relative target really lands on the woven unit.
+        assert!(link.is_file());
+        assert_eq!(
+            fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(),
+            "sshd\n"
+        );
+    }
+
+    #[test]
+    fn service_reconcile_rerun_is_idempotent() {
+        let tmp = roof_with_units(&["sshd"]);
+        let roof = tmp.path();
+
+        let first = reconcile_services(roof, &["sshd".to_string()]).unwrap();
+        let link = roof
+            .join("etc/systemd/system/multi-user.target.wants")
+            .join("sshd.service");
+        let target_before = fs::read_link(&link).unwrap();
+        let marker_before = fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap();
+
+        let second = reconcile_services(roof, &["sshd".to_string()]).unwrap();
+        assert_eq!(second.enabled, first.enabled);
+        assert_eq!(second.disabled, 0);
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_eq!(fs::read_link(&link).unwrap(), target_before, "link untouched");
+        assert_eq!(
+            fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(),
+            marker_before,
+            "marker rewrite is byte-identical"
+        );
+    }
+
+    #[test]
+    fn service_reconcile_disables_only_marker_recorded_services() {
+        let tmp = roof_with_units(&["sshd", "chronyd"]);
+        let roof = tmp.path();
+        reconcile_services(roof, &["chronyd".to_string(), "sshd".to_string()]).unwrap();
+
+        // An operator-owned entry (absolute target, like `systemctl enable`
+        // writes) that apply must never touch — it is not marker-recorded.
+        let wants = roof.join("etc/systemd/system/multi-user.target.wants");
+        fs::create_dir_all(&wants).unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/nginx.service",
+            wants.join("nginx.service"),
+        )
+        .unwrap();
+
+        // chronyd is dropped from the declarations; sshd stays.
+        let report = reconcile_services(roof, &["sshd".to_string()]).unwrap();
+        assert_eq!(report.enabled, 1);
+        assert_eq!(report.disabled, 1);
+        assert!(!wants.join("chronyd.service").exists(), "marker-recorded removal");
+        assert!(wants.join("sshd.service").exists());
+        assert!(
+            wants.join("nginx.service").symlink_metadata().is_ok(),
+            "operator-owned symlink must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(),
+            "sshd\n"
+        );
+
+        // Declaring nothing disables the rest — and still not the operator's.
+        let report = reconcile_services(roof, &[]).unwrap();
+        assert_eq!(report.enabled, 0);
+        assert_eq!(report.disabled, 1);
+        assert!(!wants.join("sshd.service").exists());
+        assert!(
+            wants.join("nginx.service").symlink_metadata().is_ok(),
+            "operator-owned symlink must survive"
+        );
+        assert_eq!(fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(), "");
+    }
+
+    #[test]
+    fn service_reconcile_warns_for_missing_units() {
+        let tmp = roof_with_units(&[]);
+        let roof = tmp.path();
+
+        let report = reconcile_services(roof, &["ghost".to_string()]).unwrap();
+        assert!(report.relevant);
+        assert_eq!(report.enabled, 0);
+        assert_eq!(report.disabled, 0);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("ghost") && report.warnings[0].contains("does not exist"),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            !roof
+                .join("etc/systemd/system/multi-user.target.wants/ghost.service")
+                .exists(),
+            "no symlink without a unit"
+        );
+        // Recorded (warned) so a later apply that stops declaring the service
+        // still sweeps the wants directory; no symlink exists to remove.
+        assert_eq!(
+            fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(),
+            "ghost\n"
+        );
+
+        let report = reconcile_services(roof, &[]).unwrap();
+        assert_eq!(report.disabled, 1, "the warned service is cleanly swept");
+        assert_eq!(fs::read_to_string(roof.join(ENABLED_SERVICES_MARKER)).unwrap(), "");
+    }
+
+    #[test]
+    fn service_reconcile_is_a_noop_without_declarations_and_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roof = tmp.path().join("fresh-roof");
+        fs::create_dir_all(&roof).unwrap();
+
+        let report = reconcile_services(&roof, &[]).unwrap();
+        assert!(!report.relevant);
+        assert_eq!(report.enabled, 0);
+        assert_eq!(report.disabled, 0);
+        assert!(report.warnings.is_empty());
+        assert!(
+            !roof.join(ENABLED_SERVICES_MARKER).exists(),
+            "no marker may be invented for a service-less roof"
+        );
+        assert!(!roof.join("etc/systemd").exists(), "no etc/systemd tree invented");
+    }
+
+    #[test]
+    fn service_reconcile_rejects_hostile_names() {
+        let tmp = roof_with_units(&[]);
+        for bad in ["../evil", "", "a/b", "sshd\n", "..", "sp ace"] {
+            let err = reconcile_services(tmp.path(), &[bad.to_string()]).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid service name"),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     // ── 4.1.6 post-weave hooks ─────────────────────────────────

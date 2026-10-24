@@ -103,6 +103,9 @@ fn build_repo(root: &Path) -> CasRepository {
             files: vec![
                 ("usr/bin/alpha", "#!/bin/sh\necho alpha\n"),
                 ("usr/lib/libalpha.so.1", "ALPHA-SO-1"),
+                // A packaged systemd unit so the PLAN 7.2.2 service reconcile
+                // can actually enable the fixture's declared `sshd` service.
+                ("usr/lib/systemd/system/sshd.service", "[Unit]\nDescription=fixture sshd\n"),
             ],
             requires: "",
             spoofs: r#"phantom_spoofs = { debian = [ { name = "libc6"; version = "2.39-0extos1"; } ]; };"#,
@@ -277,6 +280,10 @@ fn apply_weaves_phantoms_and_records_a_generation() {
     // No /etc payload and no mount sources in this fixture: both are announced.
     assert_contains(&out, "0 seeded, 0 kept (already present)");
     assert_contains(&out, "no mount sources declared");
+    // PLAN 7.2.2: the declared `sshd` service is enabled during step 6 —
+    // its unit ships with `archlinux/alpha`, so the reconcile creates the
+    // relative wants symlink with zero warnings.
+    assert_contains(&out, "services: 1 enabled, 0 disabled, 0 warning(s)");
     // Already-cached refs never hit the network.
     assert_contains(&out, "0 fetched, 3 already in the CAS");
     assert!(!out.contains("cannot fetch"));
@@ -290,6 +297,21 @@ fn apply_weaves_phantoms_and_records_a_generation() {
     assert_eq!(
         fs::read_to_string(tree.join("usr/share/gamma/data")).unwrap(),
         "gamma-db\n"
+    );
+
+    // PLAN 7.2.2: the enabled service is a relative wants symlink into the
+    // roof's FHS unit directory, and the marker records exactly this set.
+    let wants_link = tree
+        .join("etc/systemd/system/multi-user.target.wants")
+        .join("sshd.service");
+    assert_eq!(
+        fs::read_link(&wants_link).unwrap(),
+        Path::new("../../../../usr/lib/systemd/system/sshd.service")
+    );
+    assert!(wants_link.is_file(), "the relative target resolves inside the roof");
+    assert_eq!(
+        fs::read_to_string(tree.join("etc/systemd/.extos-enabled-services")).unwrap(),
+        "sshd\n"
     );
 
     // `current` points at the new generation.
