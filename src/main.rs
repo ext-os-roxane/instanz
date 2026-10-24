@@ -5,6 +5,11 @@
 //! runtime here would panic with "Cannot drop a runtime in a context where
 //! blocking is not allowed", so there is deliberately no async runtime.
 //!
+//! The one sanctioned exception is `instanz serve` (PLAN 8.1.4, `mod rpc`): it
+//! builds its own explicit multi-thread Tokio runtime and bridges every
+//! blocking domain call through `tokio::task::spawn_blocking`, whose worker
+//! threads permit blocking drops — the CLI's sync main is otherwise unchanged.
+//!
 //! Wired in Phase 2.5: `evaluate`, `apply`, `rollback`, `gc`, `generations`.
 //! Phase-4 residual: `apply` now ends with a runlevel-0 forge (initramfs + BLS
 //! matrix, PLAN 4.2.6) and an orphan-generation sweep, and `run <profile>`
@@ -15,6 +20,7 @@ mod forge;
 mod mount;
 mod orchestrate;
 mod reaper;
+mod rpc;
 mod run;
 mod system;
 
@@ -145,6 +151,38 @@ enum Commands {
         /// Generations root (default: `EXTOS_ROOTFS`)
         #[arg(long, env = "EXTOS_ROOTFS")]
         rootfs: Option<PathBuf>,
+    },
+    /// Serve the instanz gRPC control plane over a Unix domain socket (PLAN 8.1.4)
+    Serve {
+        /// Path to the gRPC control socket. Overrides `EXTOS_INSTANZ_SOCKET`;
+        /// defaults to the ARCHITECTURE §15 path (`rpc::DEFAULT_SOCKET`).
+        #[arg(long, env = "EXTOS_INSTANZ_SOCKET")]
+        socket: Option<PathBuf>,
+        /// Control-socket group override (PLAN 8.1.5). Defaults to the §15
+        /// daemon group (`extos-admin`, from `libextos::daemons::DEFAULT_SOCKETS`);
+        /// `none` (or an empty value) disables the chown entirely.
+        #[arg(long)]
+        group: Option<String>,
+        /// Generations root (default: `EXTOS_ROOTFS`); `Apply` falls back to
+        /// the config's `root` key like the CLI
+        #[arg(long, env = "EXTOS_ROOTFS")]
+        rootfs: Option<PathBuf>,
+        /// Boot root the forge writes the initramfs + BLS matrix into
+        #[arg(long, env = crate::forge::ENV_BOOT_ROOT)]
+        boot_root: Option<PathBuf>,
+        /// Legacy BLS entries directory (`gen-<n>.conf` entries, no forge)
+        #[arg(long, env = "EXTOS_BLS_DIR")]
+        bls_dir: Option<PathBuf>,
+        /// Container backend: native, nspawn, runc, crun, chroot
+        #[arg(long, env = "EXTOS_CONTAINER_BACKEND")]
+        backend: Option<String>,
+        /// System config used for `containerPermissions` lookup
+        #[arg(long, env = crate::run::ENV_SYSTEM_CONFIG)]
+        config: Option<PathBuf>,
+        /// Explicit opt-in for level-4 (privileged) launches through this
+        /// server; default deny — the same guard as `run --allow-privileged`
+        #[arg(long)]
+        allow_privileged: bool,
     },
 }
 
@@ -350,6 +388,43 @@ fn main() -> anyhow::Result<()> {
             let rootfs = require_rootfs(rootfs)?;
             let rows = generations(&rootfs)?;
             print_generations(&rootfs, &rows);
+            Ok(())
+        }
+        Commands::Serve {
+            socket,
+            group,
+            rootfs,
+            boot_root,
+            bls_dir,
+            backend,
+            config,
+            allow_privileged,
+        } => {
+            // Same mutual-exclusion rule as `apply`/`rollback`/`gc`: the forge
+            // boot root and the legacy snapshot-entries dir are two layouts.
+            let (boot_root, bls_dir) = bls_modes(boot_root, bls_dir)?;
+            let socket = socket.unwrap_or_else(|| PathBuf::from(crate::rpc::DEFAULT_SOCKET));
+            let server_config = crate::rpc::InstanzConfig {
+                rootfs,
+                boot_root,
+                bls_dir,
+                forge_scratch: forge_scratch(),
+                backend,
+                system_config: config,
+                allow_privileged,
+            };
+            tracing::info!("Serving instanz control plane on {}", socket.display());
+            match group.as_deref() {
+                // The §15 default (`extos-admin`) applies when no flag was given.
+                Some(flag) => crate::rpc::serve_with_group(
+                    &cli.repository,
+                    algo,
+                    &socket,
+                    server_config,
+                    Some(flag),
+                )?,
+                None => crate::rpc::serve(&cli.repository, algo, &socket, server_config)?,
+            };
             Ok(())
         }
     }

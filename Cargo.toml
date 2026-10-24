@@ -19,6 +19,9 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tonic = "0.14.6"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros"] }
+tonic-prost = "0.14.6"
 
 [dev-dependencies]
 tempfile = "3"
